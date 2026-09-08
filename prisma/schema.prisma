@@ -1,0 +1,383 @@
+// Prisma schema for GrabMySeats
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [postgis, postgis_topology, postgis_tiger_geocoder, fuzzystrmatch, pg_trgm]
+}
+
+model User {
+  id                String        @id @default(cuid())
+  phone             String        @unique
+  name              String?
+  trustScore        Int           @default(100)
+  strikes           Int           @default(0)
+  // Razorpay Route linked account id, required before this user can
+  // receive escrow payouts as a seller. Null until payout onboarding.
+  razorpayAccountId String?
+  isAdmin           Boolean       @default(false)
+  createdAt         DateTime      @default(now())
+  listings          Listing[]
+  purchases         Transaction[] @relation("buyer")
+  alerts            TicketAlert[]
+
+  // Profile fields - see GET/PATCH /api/users/me/profile. phone is
+  // deliberately not editable through that endpoint; it's the
+  // OTP-verified login identity, and changing it is a separate, more
+  // careful flow to design later. All nullable (including fullName) since
+  // existing users have none of this until they fill out their profile -
+  // fullName being "required" is a form-level rule on the PATCH endpoint,
+  // not a DB constraint.
+  profileImageUrl String?
+  email           String?   @unique
+  fullName        String?
+  dateOfBirth     DateTime?
+  gender          String?
+  address         String?
+  // Whether phone (below) can also be reached on WhatsApp - surfaced to
+  // the other party at contact reveal (GET /api/transactions/:id/contact,
+  // and the equivalent inline contact in the contact-only reserve
+  // response) so they know whether a wa.me link makes sense alongside the
+  // tel: link. Self-reported, not verified.
+  hasWhatsapp     Boolean   @default(false)
+
+  // Set together by POST /api/admin/users/:id/suspend (or POST
+  // /api/admin/fraud-reports/:id/resolve, which can trigger the same
+  // action); cleared together by POST /api/admin/users/:id/unsuspend.
+  // requireAuth (middleware/auth.ts) rejects a suspended user's session on
+  // every authenticated request, including login itself (see POST
+  // /api/auth/otp/verify) - with suspensionReason surfaced in that
+  // rejection, not a generic 401.
+  suspendedAt      DateTime?
+  suspensionReason String?
+
+  // Set on every successful POST /api/auth/otp/verify (both signup and
+  // login - there's no separate "signup" event). Powers GET
+  // /api/admin/metrics' "active users" count (logged in within the last 30
+  // days); not exposed on the customer-facing User shape, admin-only.
+  lastLoginAt DateTime?
+
+  fraudReportsFiled   FraudReport[] @relation("reporter")
+  fraudReportsAgainst FraudReport[] @relation("reportedUser")
+
+  ratingsGiven    Rating[] @relation("rater")
+  ratingsReceived Rating[] @relation("ratedUser")
+}
+
+enum AdminRole {
+  ADMIN
+  SUPPORT
+}
+
+// Internal staff accounts - entirely separate from User/customer auth (see
+// POST /api/admin/auth/login and middleware/adminAuth.ts): different
+// table, different password-based login, different session cookie/secret.
+// There is no public signup route for this model at all - the only ways a
+// row is ever created are backend/scripts/seedAdmin.ts (the first ADMIN,
+// run manually once) and POST /api/admin/staff (ADMIN-only, for everyone
+// after that).
+model AdminUser {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  passwordHash String
+  role         AdminRole
+  // Revocation switch for PATCH /api/admin/staff/:id - toggled off instead
+  // of deleting the row, so past actions (audit trail via
+  // createdByAdminId below, and anything logged elsewhere by admin id)
+  // stay attributable to a real account. Checked on every admin-
+  // authenticated request, not just at login, so revoking access takes
+  // effect immediately rather than waiting for the session to expire.
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  // Null for the seed-script-created first ADMIN; set for every account
+  // created via POST /api/admin/staff. Self-relation, not a foreign key
+  // to "whoever created every user" - purely an admin-side audit trail.
+  createdByAdminId String?
+  createdByAdmin   AdminUser?  @relation("createdStaff", fields: [createdByAdminId], references: [id])
+  createdStaff     AdminUser[] @relation("createdStaff")
+}
+
+enum ListingStatus {
+  ACTIVE
+  PARTIALLY_SOLD
+  SOLD
+  EXPIRED
+  FLAGGED
+  // Seller pulled the listing down themselves (changed their mind, sold it
+  // entirely outside the app, etc.) via POST /api/listings/:id/deactivate -
+  // distinct from EXPIRED (which is reserved for the showtime passing
+  // naturally) so the two are distinguishable in reporting, even though no
+  // job currently sets EXPIRED on a Listing.
+  WITHDRAWN
+}
+
+enum DeliveryMethod {
+  IN_PERSON
+  EMAIL_FORWARD
+}
+
+enum Category {
+  MOVIE
+  EVENT
+  SPORT
+}
+
+model Listing {
+  id              String                                 @id @default(cuid())
+  sellerId        String
+  seller          User                                   @relation(fields: [sellerId], references: [id])
+  // Defaults to MOVIE so existing rows (and any caller that doesn't send
+  // one) land in the category the app was originally built around. Only
+  // affects the sell form's field labels and OCR auto-fill (see POST
+  // /api/listings/ocr) and the buy page's category filter - reservation,
+  // contact-reveal, delivery method, mark-sold/deactivate, and edit are
+  // all category-agnostic by design and never branch on this.
+  category        Category                               @default(MOVIE)
+  movieName       String
+  theaterName     String
+  theaterLat      Float
+  theaterLng      Float
+  // Kept in sync with theaterLat/theaterLng by a DB trigger (see migration) -
+  // not written to directly by Prisma Client. Powers ST_DWithin searches.
+  theaterLocation Unsupported("geography(Point, 4326)")?
+  showtime        DateTime
+  bookingId       String // for verification
+  totalSeats      Int
+  availableSeats  Int
+  // Seats currently held by unexpired RESERVED transactions. Free seats
+  // for a new reservation = availableSeats - reservedSeats.
+  reservedSeats   Int                                    @default(0)
+  pricePerSeat    Float
+  // What the seller offers - one or both, chosen at listing creation. A
+  // buyer picks one of these on reserve (see Transaction.deliveryMethod
+  // below). EMAIL_FORWARD is only accepted here if the seller passes the
+  // trust gate at creation time - see lib/sellerTrust.ts.
+  availableDeliveryMethods DeliveryMethod[] @default([IN_PERSON])
+  // What the booking confirmation shows as actually paid, when detected
+  // (OCR'd, or seller-corrected on the sell form) - null when not
+  // detected/not entered. Enforced at creation (see POST /api/listings):
+  // pricePerSeat * totalSeats must not exceed this by more than a small
+  // rounding/OCR-noise tolerance. Kept afterward for dispute evidence.
+  totalAmountPaid Float?
+  qrData          String? // if per-seat QR available
+  screenshotUrl   String? // uploaded booking confirmation screenshot
+  status          ListingStatus                          @default(ACTIVE)
+  createdAt       DateTime                               @default(now())
+  transactions    Transaction[]
+  alertNotifications AlertNotification[]
+}
+
+enum TxnStatus {
+  PENDING
+  RESERVED
+  EXPIRED
+  ESCROWED
+  BUYER_CONFIRMED
+  PAYOUT_RELEASED
+  DISPUTED
+  REFUNDED
+}
+
+model Transaction {
+  id        String  @id @default(cuid())
+  listingId String
+  listing   Listing @relation(fields: [listingId], references: [id])
+  buyerId   String
+  buyer     User    @relation("buyer", fields: [buyerId], references: [id])
+
+  seatsCount Int
+  amountPaid Float
+  status     TxnStatus @default(PENDING)
+  // Buyer's choice, at reserve time, of one of the listing's
+  // availableDeliveryMethods - see POST /api/listings/:id/reserve, which
+  // validates it's actually offered before writing it here. Governs which
+  // check-ins are required before confirm-receipt: IN_PERSON needs both
+  // parties' venue check-in (unchanged); EMAIL_FORWARD skips the seller's
+  // and instead gates on emailForwardSubmittedAt below. The buyer's own
+  // venue check-in is mandatory either way.
+  deliveryMethod DeliveryMethod @default(IN_PERSON)
+
+  // Set when status becomes RESERVED; the reservation-expiry job flips
+  // still-RESERVED rows past this timestamp to EXPIRED.
+  reservationExpiresAt DateTime?
+
+  // Razorpay order backing the escrow payment, set once payment is initiated.
+  // Unique so the webhook handler can reliably look up a transaction by it.
+  razorpayOrderId String? @unique
+
+  // Set together with status -> PAYOUT_RELEASED by the payout-release job.
+  // Unique, and used as the "already released" guard in that job's query -
+  // a transaction with a transferId is never selected again, including
+  // under concurrent cron runs.
+  transferId String? @unique
+
+  // Set together with status -> REFUNDED by POST
+  // /api/admin/transactions/:id/refund. Unique, same guard pattern as
+  // transferId above.
+  refundId   String?   @unique
+  refundedAt DateTime?
+
+  // Geo check-in for the in-person meetup: each party submits their
+  // location near showtime, validated against the venue via Haversine
+  // distance (see lib/geo/haversine.ts). Both must be set before
+  // confirm-receipt is allowed.
+  buyerCheckInLat  Float?
+  buyerCheckInLng  Float?
+  buyerCheckInAt   DateTime?
+  sellerCheckInLat Float?
+  sellerCheckInLng Float?
+  sellerCheckInAt  DateTime?
+
+  // EMAIL_FORWARD delivery only: the seller's post-escrow forward of the
+  // original booking confirmation email, uploaded as a file (stored via
+  // storageProvider, same as the listing screenshot) and/or pasted text.
+  // At least one of the two is required to submit - see POST
+  // /api/transactions/:id/email-forward. Content is only ever revealed to
+  // the buyer via GET /api/transactions/:id/email-forward, same
+  // access-control pattern as the listing screenshot; emailForwardSubmittedAt
+  // alone (not the content) is exposed on the plain Transaction shape so
+  // both parties can see submission status.
+  emailForwardFileUrl     String?
+  emailForwardText        String?
+  emailForwardSubmittedAt DateTime?
+
+  confirmedAt DateTime?
+  payoutAt    DateTime?
+  createdAt   DateTime  @default(now())
+
+  reviewFlags ManualReviewFlag[]
+  fraudReports FraudReport[]
+  // At most one - see Rating.transactionId's @unique below. Nullable
+  // because most transactions are never rated (rating is optional, buyer-
+  // initiated, and this feature postdates plenty of existing rows).
+  rating Rating?
+}
+
+// A payment.captured webhook arrived for a transaction whose reservation
+// was no longer payable (expired, or otherwise not RESERVED). Money moved
+// on Razorpay's side but our system couldn't auto-allocate it - queued
+// here for an operator to reconcile manually (refund, or re-link once the
+// listing is checked) instead of only surfacing in logs.
+model ManualReviewFlag {
+  id              String      @id @default(cuid())
+  transactionId   String
+  transaction     Transaction @relation(fields: [transactionId], references: [id])
+  reason          String
+  razorpayOrderId String
+  amountPaid      Float
+  createdAt       DateTime    @default(now())
+  resolvedAt      DateTime?
+
+  @@index([resolvedAt])
+}
+
+// "Notify me" saved search - see POST /api/alerts. jobs/matchAlerts.ts
+// scans recently-created Listings against active, non-expired alerts and
+// SMSes a match once (see AlertNotification below for the "once" part).
+model TicketAlert {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  titleQuery String
+  // Set only when the search that spawned this alert used the city picker
+  // rather than precise geolocation - display-only (e.g. "near Bengaluru"
+  // on /account/alerts); matching itself always uses lat/lng.
+  cityId     String?
+  lat        Float
+  lng        Float
+  // Kept in sync with lat/lng by a DB trigger (see migration), same
+  // pattern as Listing.theaterLocation - powers matchAlerts.ts's
+  // ST_DWithin check.
+  location Unsupported("geography(Point, 4326)")?
+  radiusKm Float    @default(7)
+  category Category @default(MOVIE)
+  isActive Boolean  @default(true)
+  createdAt DateTime @default(now())
+  // Default window is 14 days from creation (see POST /api/alerts) -
+  // "extendable" is a future affordance, not implemented in this pass;
+  // for now an expired alert just stops matching and has to be recreated.
+  expiresAt DateTime
+
+  notifications AlertNotification[]
+
+  @@index([isActive, expiresAt])
+}
+
+// Records that a given alert has already fired for a given listing, so
+// matchAlerts.ts never SMSes the same user twice for the same match even
+// if it re-scans a listing across multiple runs.
+model AlertNotification {
+  id         String      @id @default(cuid())
+  alertId    String
+  alert      TicketAlert @relation(fields: [alertId], references: [id])
+  listingId  String
+  listing    Listing     @relation(fields: [listingId], references: [id])
+  notifiedAt DateTime    @default(now())
+
+  @@unique([alertId, listingId])
+}
+
+enum FraudReportStatus {
+  PENDING
+  REVIEWED
+  ACTIONED
+  DISMISSED
+}
+
+// POST /api/fraud-reports (reporter-facing) / GET /api/admin/fraud-reports
+// + POST /api/admin/fraud-reports/:id/resolve (admin-facing). Resolving
+// with ACTIONED can suspend reportedUser in the same call - see
+// routes/admin.ts.
+model FraudReport {
+  id             String            @id @default(cuid())
+  reporterId     String
+  reporter       User              @relation("reporter", fields: [reporterId], references: [id])
+  reportedUserId String
+  reportedUser   User              @relation("reportedUser", fields: [reportedUserId], references: [id])
+  // Optional: the reporter isn't required to be reporting about a specific
+  // transaction (e.g. a suspicious contact-reveal before ever completing
+  // one) - see POST /api/fraud-reports.
+  relatedTransactionId String?
+  relatedTransaction   Transaction? @relation(fields: [relatedTransactionId], references: [id])
+  description    String
+  // Uploaded via the same StorageProvider as listing screenshots / the
+  // email-forward attachment - see middleware/upload.ts's
+  // uploadFraudEvidence (multiple files, unlike those single-file uploads).
+  evidenceUrls   String[]
+  status         FraudReportStatus @default(PENDING)
+  createdAt      DateTime          @default(now())
+  reviewedAt     DateTime?
+
+  @@index([status])
+}
+
+// Buyer-to-seller rating: POST /api/transactions/:id/rate (buyer-only,
+// requires being the buyer on that transaction) / GET
+// /api/users/:id/rating-summary (public - the aggregate consumed by the
+// listing detail page and contact-reveal screen, see
+// lib/ratingSummary.ts). One per transaction (never per listing or per
+// seller-buyer pair overall) - a buyer who transacts with the same seller
+// twice can rate each of those experiences separately. Sellers are never
+// rated by anyone but the actual buyer on the specific transaction being
+// rated, and never rate buyers - this is one-directional by design.
+model Rating {
+  id            String      @id @default(cuid())
+  raterId       String
+  rater         User        @relation("rater", fields: [raterId], references: [id])
+  ratedUserId   String
+  ratedUser     User        @relation("ratedUser", fields: [ratedUserId], references: [id])
+  transactionId String      @unique
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  stars         Int
+  comment       String?
+  createdAt     DateTime    @default(now())
+
+  @@index([ratedUserId])
+}
